@@ -1,0 +1,162 @@
+bin---
+title: "SCT matching V1.0"
+output: html_notebook
+---
+```{r}
+#Loading libraries. 
+#The memory.limit function was required on the computer I used to increase the memory size so that large tables could be loaded. It may not be needed in all cases.
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+memory.limit(size=56000)
+```
+
+```{r}
+#Load HistoTrac tables.
+(Patient <- readRDS(file = "Patient.rds"))
+(PatientCase <- readRDS(file = "PatientCase.rds"))
+(RelatedPatient <- readRDS(file = "RelatedPatient.rds"))
+(TestDetail <- readRDS(file = "TestDetail.rds"))
+(Sample <- readRDS(file = "Sample.rds"))
+(Test <- readRDS(file = "Test.rds"))
+(UserTest <- readRDS(file = "UserTest.rds"))
+(TransplantHistory <- readRDS(file = "TransplantHistory.rds"))
+(Xmatch <- readRDS(file = "Xmatch.rds"))
+```
+
+```{r}
+#Generate a simplified patient table. 
+(Simple_patients <- Patient 
+   %>% filter(PatientTypeCd == "Patient")
+   %>% select(PatientId, HospitalID, firstnm, lastnm, DOB, categoryCd: GenderCd, PatientTypeCd, mA1Cd:mDPB12cd, StatusCd, UnacceptAntigenTxt, mA1EqCd, mDPB12EqCd, UNOSCPRAAmt, UNOSUnacceptAntigenTxt)
+      )
+
+#Generate a simplified donor table.
+(Simple_donors <- Patient 
+   %>% filter(PatientTypeCd == "Donor")
+   %>% select(PatientId, HospitalID, firstnm, lastnm, DOB, categoryCd: GenderCd, PatientTypeCd, mA1Cd:mDPB12cd, StatusCd, UnacceptAntigenTxt, mA1EqCd, mDPB12EqCd, UNOSCPRAAmt, UNOSUnacceptAntigenTxt)
+      )
+
+#Select BMT patients with high-resolution typing
+(BMT_patients <- Simple_patients 
+   %>% filter(categoryCd == "Bone Marrow")
+   %>% filter (str_detect(mA1Cd, ':'))
+   %>% filter (str_detect(mB1Cd, ':'))
+   %>% filter (str_detect(mC1Cd, ':'))
+   %>% filter (str_detect(mDRB11Cd, ':'))
+   %>% filter (str_detect(mDQB11cd, ':'))
+   %>% filter (str_detect(mDPB11cd, ':'))
+      )
+
+#Select BMT donors with high-resolution typing
+(BMT_donors <- Simple_donors 
+   %>% filter(categoryCd == "NMDP BMD" | categoryCd == "Bone Marrow")
+   %>% filter (str_detect(mA1Cd, ':'))
+   %>% filter (str_detect(mB1Cd, ':'))
+   %>% filter (str_detect(mC1Cd, ':'))
+   %>% filter (str_detect(mDRB11Cd, ':'))
+   %>% filter (str_detect(mDQB11cd, ':'))
+   %>% filter (str_detect(mDPB11cd, ':'))
+      )
+```
+
+```{r}
+#Copy typing from first allele at each locus to second in cases of homozygosity. This will ensure accurate matching.
+(BMT_patients_full <- BMT_patients
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+   %>% mutate(mA2Cd = coalesce(mA2Cd, mA1Cd))  
+   %>% mutate(mB2Cd = coalesce(mB2Cd, mB1Cd)) 
+   %>% mutate(mC2Cd = coalesce(mC2Cd, mC1Cd)) 
+   %>% mutate(mDRB12Cd = coalesce(mDRB12Cd, mDRB11Cd)) 
+   %>% mutate(mDQA12Cd = coalesce(mDQA12Cd, mDQA11Cd)) 
+   %>% mutate(mDQB12cd = coalesce(mDQB12cd, mDQB11cd)) 
+   %>% mutate(mDPA12Cd = coalesce(mDPA12Cd, mDPA11Cd)) 
+   %>% mutate(mDPB12cd = coalesce(mDPB12cd, mDPB11cd))
+   )
+
+(BMT_donors_full <- BMT_donors
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+   %>% mutate(mA2Cd = coalesce(mA2Cd, mA1Cd))  
+   %>% mutate(mB2Cd = coalesce(mB2Cd, mB1Cd)) 
+   %>% mutate(mC2Cd = coalesce(mC2Cd, mC1Cd)) 
+   %>% mutate(mDRB12Cd = coalesce(mDRB12Cd, mDRB11Cd)) 
+   %>% mutate(mDQA12Cd = coalesce(mDQA12Cd, mDQA11Cd)) 
+   %>% mutate(mDQB12cd = coalesce(mDQB12cd, mDQB11cd)) 
+   %>% mutate(mDPA12Cd = coalesce(mDPA12Cd, mDPA11Cd)) 
+   %>% mutate(mDPB12cd = coalesce(mDPB12cd, mDPB11cd))
+   )
+```
+
+```{r}
+#Link donors to recipients. This links patients with the PatientCase table, then the RelatedPatient table, then to the BMT_donors_full table. This will add new rows whenever a patient has a donor.  
+(linked_cases <- BMT_patients_full 
+   %>% left_join(PatientCase, by = "PatientId") 
+   %>% left_join(RelatedPatient, by = "CaseId") 
+   %>% left_join(BMT_donors_full, by= c("RelatedPatientID" = "PatientId"), suffix = c(".recipient", ".donor"))
+   %>% select(PatientId:mDPB12cd.recipient, RelationshipTypeCd, HospitalID.donor:categoryCd.donor, RaceCd.donor:GenderCd.donor, mA1Cd.donor:StatusCd)
+   %>% filter(!is.na(mA1Cd.donor))
+    )
+```
+
+```{r}
+#Determine mismatched alleles and matching.
+
+#The mutate function makes new columns for mismatches at each locus in both directions. For the first line of code, the code makes a new column called "A.1.HvG," and then looks at the value of "mA1Cd.donor" to see if it is present in either "mA1Cd.recipient" or "mA2Cd.recipient." If it finds the value in either, then it records "NA" in "A.1.HvG." The "TRUE" argument copies the value of "mA1Cd.donor" whenever that value is not found in either of the recipient columns. An easier way to understand this is to see that "case_when" is similar to "if_else:" if the value of "mA1Cd.donor" is found in either "mA1Cd.recipient" or "mA2Cd.recipient," then record "NA," else, copy the value of "mA1Cd.donor."
+
+(BMT_cases_MM <- linked_cases 
+ #A locus mismatches
+   %>% mutate(A.1.HvG = case_when(mA1Cd.donor == mA1Cd.recipient | mA1Cd.donor == mA2Cd.recipient ~ NA_character_, TRUE ~ as.character(mA1Cd.donor))) 
+   %>% mutate(A.2.HvG = case_when(mA2Cd.donor == mA1Cd.recipient | mA2Cd.donor == mA2Cd.recipient ~ NA_character_, TRUE ~ as.character(mA2Cd.donor)))
+   %>% mutate(A.1.GvH = case_when(mA1Cd.recipient == mA1Cd.donor | mA1Cd.recipient == mA2Cd.donor ~ NA_character_, TRUE ~ as.character(mA1Cd.recipient)))
+   %>% mutate(A.2.GvH = case_when(mA2Cd.recipient == mA1Cd.donor | mA2Cd.recipient == mA2Cd.donor ~ NA_character_, TRUE ~ as.character(mA2Cd.recipient)))
+#B locus mismatches 
+   %>% mutate(B.1.HvG = case_when(mB1Cd.donor == mB1Cd.recipient | mB1Cd.donor == mB2Cd.recipient ~ NA_character_, TRUE ~ as.character(mB1Cd.donor))) 
+   %>% mutate(B.2.HvG = case_when(mB2Cd.donor == mB1Cd.recipient | mB2Cd.donor == mB2Cd.recipient ~ NA_character_, TRUE ~ as.character(mB2Cd.donor)))
+   %>% mutate(B.1.GvH = case_when(mB1Cd.recipient == mB1Cd.donor | mB1Cd.recipient == mB2Cd.donor ~ NA_character_, TRUE ~ as.character(mB1Cd.recipient)))
+   %>% mutate(B.2.GvH = case_when(mB2Cd.recipient == mB1Cd.donor | mB2Cd.recipient == mB2Cd.donor ~ NA_character_, TRUE ~ as.character(mB2Cd.recipient)))
+#C locus mismatches 
+   %>% mutate(C.1.HvG = case_when(mC1Cd.donor == mC1Cd.recipient | mC1Cd.donor == mC2Cd.recipient ~ NA_character_, TRUE ~ as.character(mC1Cd.donor))) 
+   %>% mutate(C.2.HvG = case_when(mC2Cd.donor == mC1Cd.recipient | mC2Cd.donor == mC2Cd.recipient ~ NA_character_, TRUE ~ as.character(mC2Cd.donor)))
+   %>% mutate(C.1.GvH = case_when(mC1Cd.recipient == mC1Cd.donor | mC1Cd.recipient == mC2Cd.donor ~ NA_character_, TRUE ~ as.character(mC1Cd.recipient)))
+   %>% mutate(C.2.GvH = case_when(mC2Cd.recipient == mC1Cd.donor | mC2Cd.recipient == mC2Cd.donor ~ NA_character_, TRUE ~ as.character(mC2Cd.recipient)))
+#DRB1 locus mismatches 
+   %>% mutate(DRB1.1.HvG = case_when(mDRB11Cd.donor == mDRB11Cd.recipient | mDRB11Cd.donor == mDRB12Cd.recipient ~ NA_character_, TRUE ~ as.character(mDRB11Cd.donor))) 
+   %>% mutate(DRB1.2.HvG = case_when(mDRB12Cd.donor == mDRB11Cd.recipient | mDRB12Cd.donor == mDRB12Cd.recipient ~ NA_character_, TRUE ~ as.character(mDRB12Cd.donor)))
+   %>% mutate(DRB1.1.GvH = case_when(mDRB11Cd.recipient == mDRB11Cd.donor | mDRB11Cd.recipient == mDRB12Cd.donor ~ NA_character_, TRUE ~ as.character(mDRB11Cd.recipient)))
+   %>% mutate(DRB1.2.GvH = case_when(mDRB12Cd.recipient == mDRB11Cd.donor | mDRB12Cd.recipient == mDRB12Cd.donor ~ NA_character_, TRUE ~ as.character(mDRB12Cd.recipient)))
+#DQB1 locus mismatches 
+   %>% mutate(DQB1.1.HvG = case_when(mDQB11cd.donor == mDQB11cd.recipient | mDQB11cd.donor == mDQB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDQB11cd.donor))) 
+   %>% mutate(DQB1.2.HvG = case_when(mDQB12cd.donor == mDQB11cd.recipient | mDQB12cd.donor == mDQB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDQB12cd.donor)))
+   %>% mutate(DQB1.1.GvH = case_when(mDQB11cd.recipient == mDQB11cd.donor | mDQB11cd.recipient == mDQB12cd.donor ~ NA_character_, TRUE ~ as.character(mDQB11cd.recipient)))
+   %>% mutate(DQB1.2.GvH = case_when(mDQB12cd.recipient == mDQB11cd.donor | mDQB12cd.recipient == mDQB12cd.donor ~ NA_character_, TRUE ~ as.character(mDQB12cd.recipient)))
+#DPB1 locus mismatches 
+   %>% mutate(DPB1.1.HvG = case_when(mDPB11cd.donor == mDPB11cd.recipient | mDPB11cd.donor == mDPB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDPB11cd.donor))) 
+   %>% mutate(DPB1.2.HvG = case_when(mDPB12cd.donor == mDPB11cd.recipient | mDPB12cd.donor == mDPB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDPB12cd.donor)))
+   %>% mutate(DPB1.1.GvH = case_when(mDPB11cd.recipient == mDPB11cd.donor | mDPB11cd.recipient == mDPB12cd.donor ~ NA_character_, TRUE ~ as.character(mDPB11cd.recipient)))
+   %>% mutate(DPB1.2.GvH = case_when(mDPB12cd.recipient == mDPB11cd.donor | mDPB12cd.recipient == mDPB12cd.donor ~ NA_character_, TRUE ~ as.character(mDPB12cd.recipient)))
+   )
+
+#Count matches at each locus
+#Since the columns "A.1.HvG," etc. list mismatched alleles, then matches show up as "NA." Therefore, counting "NA" values will yield matches. A single, bi-directional mismatch at a locus will show up once in the HvG column, and once in the GvH column (for the donor and recipient mismatches, respectively), so the total number of matches has to be divided by 2 to result in the match number. For unidirectional mismatches, only 1 mismatched allele will show up, and there will be an extra "NA" value, which, when divided by 2, with result in a number (either 0.5 or 1.5) that is not an integer. The "floor" function rounds these numbers down, resulting in appropriate counting of matches for unidirectional mismatches.
+
+(BMT_cases_MM_matches <- BMT_cases_MM
+#A locus matches
+   %>% mutate(A_matches = as.integer(floor((is.na(A.1.HvG) + is.na(A.2.HvG) + is.na(A.1.GvH) + is.na(A.2.GvH)) / 2)))
+#B locus matches
+   %>% mutate(B_matches = as.integer(floor((is.na(B.1.HvG) + is.na(B.2.HvG) + is.na(B.1.GvH) + is.na(B.2.GvH)) / 2)))
+#C locus matches
+   %>% mutate(C_matches = as.integer(floor((is.na(C.1.HvG) + is.na(C.2.HvG) + is.na(C.1.GvH) + is.na(C.2.GvH)) / 2)))
+#DRB1 locus matches
+   %>% mutate(DRB1_matches = as.integer(floor((is.na(DRB1.1.HvG) + is.na(DRB1.2.HvG) + is.na(DRB1.1.GvH) + is.na(DRB1.2.GvH)) / 2)))
+#DQB1 locus matches
+   %>% mutate(DQB1_matches = as.integer(floor((is.na(DQB1.1.HvG) + is.na(DQB1.2.HvG) + is.na(DQB1.1.GvH) + is.na(DQB1.2.GvH)) / 2)))
+#DPB1 locus matches
+   %>% mutate(DPB1_matches = as.integer(floor((is.na(DPB1.1.HvG) + is.na(DPB1.2.HvG) + is.na(DPB1.1.GvH) + is.na(DPB1.2.GvH)) / 2)))
+
+#Count matches out of 8, 10, and 12
+   %>% mutate(out_of_8 = A_matches + B_matches + C_matches + DRB1_matches)
+   %>% mutate(out_of_10 = A_matches + B_matches + C_matches + DRB1_matches + DQB1_matches)
+   %>% mutate(out_of_12 = A_matches + B_matches + C_matches + DRB1_matches + DQB1_matches +DPB1_matches)
+   )
+```
+
